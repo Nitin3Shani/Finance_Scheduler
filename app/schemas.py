@@ -41,6 +41,16 @@ class TrackProductRequest(BaseModel):
     initial_amazon_price: float | None = Field(default=None, gt=0)
     initial_flipkart_price: float | None = Field(default=None, gt=0)
 
+class TrackedProductResponse(BaseModel):
+    id: int
+    title: str
+    image_url: str | None = None
+    amazon_url: str | None = None
+    flipkart_url: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
 class PricePoint(BaseModel):
     timestamp: datetime
     amazon_price: float | None = None

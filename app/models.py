@@ -33,11 +33,11 @@ class TrackedProduct(Base):
 
     owner: Mapped["User"] = relationship(back_populates="products")
     price_history: Mapped[list["PriceHistory"]] = relationship(
-        back_populates="product", cascade="all, delete-orphan"
-    )
+    back_populates="product", cascade="all, delete-orphan", passive_deletes=True
+)
     alert: Mapped["PriceAlert | None"] = relationship(
-        back_populates="product", uselist=False, cascade="all, delete-orphan"
-    )
+    back_populates="product", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+)
 
 
 class PriceHistory(Base):
