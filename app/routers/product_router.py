@@ -1,5 +1,6 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -7,15 +8,16 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models import PriceHistory, TrackedProduct, User
 from app.schemas import (
+    PlatformStats,
+    PlatformStatsGroup,
     PricePoint,
     ProductHistoryResponse,
     SearchCompareResponse,
-    TrackedProductResponse,
     TrackProductRequest,
+    TrackedProductResponse,
 )
-from app.services.scraper import compare_platforms, scrape_direct_product_price
 from app.services.scheduler import check_all_tracked_products
-from datetime import datetime
+from app.services.scraper import compare_platforms, scrape_direct_product_price
 
 MAX_TRACKED_PRODUCTS = 10
 router = APIRouter(prefix="/products", tags=["Products & Price Tracking"])
@@ -117,17 +119,36 @@ async def get_product_history(
     )
     product = result.scalar_one_or_none()
     if not product:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Product not found"
+        )
 
+    # Sort history chronologically
     sorted_history = sorted(product.price_history, key=lambda h: h.checked_at)
-    prices = [entry.price for entry in sorted_history]
+    
+    # Safely extract non-None prices per platform and combined
+    amazon_prices = [h.price for h in sorted_history if h.platform == "amazon" and h.price is not None]
+    flipkart_prices = [h.price for h in sorted_history if h.platform == "flipkart" and h.price is not None]
+    all_prices = [h.price for h in sorted_history if h.price is not None]
 
+    def calc_stats(prices: list[float]):
+        if not prices:
+            return {"lowest": None, "highest": None, "average": None}
+        return {
+            "lowest": min(prices),
+            "highest": max(prices),
+            "average": round(sum(prices) / len(prices), 2),
+        }
+
+    # Group chart points by minute timestamp
     buckets: dict[datetime, PricePoint] = {}
     for entry in sorted_history:
-        key = entry.checked_at.replace(second=0, microsecond=0)   # group by minute
+        key = entry.checked_at.replace(second=0, microsecond=0)
         point = buckets.get(key)
         if point is None:
             point = buckets[key] = PricePoint(timestamp=key)
+            
         if entry.platform == "amazon":
             point.amazon_price = entry.price
         elif entry.platform == "flipkart":
@@ -138,9 +159,15 @@ async def get_product_history(
     return ProductHistoryResponse(
         product_id=product.id,
         title=product.title,
-        lowest_price=min(prices) if prices else None,
-        highest_price=max(prices) if prices else None,
-        average_price=round(sum(prices) / len(prices), 2) if prices else None,
+        # Global combined summary metrics
+        lowest_price=min(all_prices) if all_prices else None,
+        highest_price=max(all_prices) if all_prices else None,
+        average_price=round(sum(all_prices) / len(all_prices), 2) if all_prices else None,
+        # Per-platform breakdown
+        stats_by_platform={
+            "amazon": calc_stats(amazon_prices),
+            "flipkart": calc_stats(flipkart_prices),
+        },
         chart_data=chart_data,
     )
 

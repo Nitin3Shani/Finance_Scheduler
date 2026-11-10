@@ -38,8 +38,8 @@ class TrackProductRequest(BaseModel):
     image_url: str | None = Field(default=None, max_length=1000)
     amazon_url: str | None = Field(default=None, max_length=1000, pattern=r"^https?://.*")
     flipkart_url: str | None = Field(default=None, max_length=1000, pattern=r"^https?://.*")
-    initial_amazon_price: float | None = Field(default=None, gt=0)
-    initial_flipkart_price: float | None = Field(default=None, gt=0)
+    initial_amazon_price: float  = Field(gt=0)
+    initial_flipkart_price: float  = Field( gt=0)
 
 class TrackedProductResponse(BaseModel):
     id: int
