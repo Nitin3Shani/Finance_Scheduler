@@ -14,6 +14,7 @@ from app.schemas import (
     TrackProductRequest,
 )
 from app.services.scraper import compare_platforms, scrape_direct_product_price
+from app.services.scheduler import check_all_tracked_products
 from datetime import datetime
 
 MAX_TRACKED_PRODUCTS = 10
@@ -185,6 +186,14 @@ async def refresh_product_now(
     return await get_product_history(product_id, db, current_user)
 
 
+@router.post("/test-trigger-job")
+async def trigger_price_check_job(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Manually invoke the 6-hour scheduler function right now for testing."""
+    await check_all_tracked_products()
+    return {"message": "Scheduled price check executed immediately"}
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_tracked_product(

@@ -18,11 +18,14 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
 
 # ---------------------------------------------------------------------------
-# Amazon selectors: several per field, tried in order, so one HTML change
-# doesn't break everything. Edit these lists when Amazon changes its markup.
+# Amazon selectors
 # ---------------------------------------------------------------------------
 AMAZON_BASE = "https://www.amazon.in"
 AMAZON_CARD = "div[data-component-type='s-search-result']"
@@ -32,20 +35,39 @@ AMAZON_LINK = ["h2 a", "a.a-link-normal[href*='/dp/']"]
 AMAZON_IMAGE = ["img.s-image", "img"]
 
 # ---------------------------------------------------------------------------
-# Flipkart selectors (class names are obfuscated and change often)
+# Flipkart selectors (with class-agnostic fallbacks)
 # ---------------------------------------------------------------------------
 FLIPKART_BASE = "https://www.flipkart.com"
 FLIPKART_CARD = "div[data-id]"
-FLIPKART_TITLE = ["div.KzDlHZ", "a.wjcEIp", "a.IRpwTa", "a.WKTcLC"]
+FLIPKART_TITLE = ["div.KzDlHZ", "a.wjcEIp", "a.IRpwTa", "a.WKTcLC", "div._4rR01T"]
 FLIPKART_PRICE = ["div.Nx9bqj", "div._30jeq3"]
 FLIPKART_LINK = ["a[href*='/p/']"]
 FLIPKART_IMAGE = ["img"]
 
-# Matching and limits
-MAX_CARDS_TO_SCORE = 10   # only compare the top results
-MIN_MATCH_SCORE = 0.5     # at least half the query words must appear in the title
+MAX_CARDS_TO_SCORE = 15
+MIN_MATCH_SCORE = 0.5
 
-# Text that shows up on CAPTCHA / bot-check pages
+# Words indicating accessories/parts unless the user explicitly searched for them
+ACCESSORY_TERMS = (
+    "compatible with",
+    "for iphone",
+    "for samsung",
+    "back cover",
+    "phone case",
+    "flip cover",
+    "screen guard",
+    "screen protector",
+    "tempered glass",
+    "oled screen",
+    "touch digitizer",
+    "replacement screen",
+    "display combo",
+    "camera lens protector",
+    "charging cable",
+    "adapter",
+    "skin wrap",
+)
+
 BLOCK_MARKERS = (
     "captcha",
     "enter the characters you see below",
@@ -54,7 +76,6 @@ BLOCK_MARKERS = (
     "unusual traffic",
 )
 
-# Simple in-memory cache so the same query isn't scraped repeatedly
 CACHE_TTL_SECONDS = 600
 _cache: dict[str, tuple[float, SearchCompareResponse]] = {}
 
@@ -62,15 +83,10 @@ _PRICE_PATTERN = re.compile(r"\d[\d.,]*\d|\d")
 _RUPEE_PATTERN = re.compile(r"₹\s*([\d,]+(?:\.\d+)?)")
 
 
-
-# Helpers
-
 def _clean_price(raw_text: str | None) -> float | None:
-
     if not raw_text:
         return None
 
-    # Only the FIRST number-like chunk, so "₹1,299 - ₹1,499" gives 1,299
     match = _PRICE_PATTERN.search(raw_text)
     if not match:
         return None
@@ -80,20 +96,17 @@ def _clean_price(raw_text: str | None) -> float | None:
     last_comma = number.rfind(",")
 
     if last_dot != -1 and last_comma != -1:
-        # Both present: whichever comes last is the decimal separator
-        if last_comma > last_dot:      # European: 1.299,00
+        if last_comma > last_dot:
             number = number.replace(".", "").replace(",", ".")
-        else:                          # US / India: 1,299.00
+        else:
             number = number.replace(",", "")
     elif last_comma != -1:
-        # Only commas: "1,299" is thousands, "12,50" is decimal
         digits_after = len(number) - last_comma - 1
         if digits_after == 3:
             number = number.replace(",", "")
         else:
             number = number.replace(",", ".")
     elif number.count(".") > 1:
-        # Several dots: "1.299.000" uses dots as thousands separators
         number = number.replace(".", "")
 
     try:
@@ -105,7 +118,6 @@ def _clean_price(raw_text: str | None) -> float | None:
 
 
 def _first(card: Tag, selectors: list[str]) -> Tag | None:
-    """Return the first element matched by any selector, tried in order."""
     for selector in selectors:
         element = card.select_one(selector)
         if element:
@@ -118,22 +130,39 @@ def _is_blocked(html: str) -> bool:
     return any(marker in lowered for marker in BLOCK_MARKERS)
 
 
+def _is_unwanted_accessory(query: str, title: str) -> bool:
+    """Reject covers, tempered glass, and spare screens unless user searched for them."""
+    q_lower = query.lower()
+    t_lower = title.lower()
+    for term in ACCESSORY_TERMS:
+        if term in t_lower and term not in q_lower:
+            return True
+    # Also catch generic "cover" / "case" / "glass" when user didn't ask for one
+    for word in ("cover", "case", "tempered", "digitizer", "protector"):
+        if re.search(rf"\b{word}\b", t_lower) and word not in q_lower:
+            return True
+    return False
+
+
 def _match_score(query: str, title: str) -> float:
-    """Fraction of query words that appear in the title (0.0 to 1.0)."""
     query_words = set(re.findall(r"\w+", query.lower()))
     if not query_words:
         return 0.0
     title_words = set(re.findall(r"\w+", title.lower()))
-    return len(query_words & title_words) / len(query_words)
+    overlap = len(query_words & title_words) / len(query_words)
+
+    # Bonus if the title actually starts with the brand/product rather than "For ..."
+    if title.lower().startswith(("compatible", "for ", "pack of")):
+        overlap -= 0.4
+    return overlap
 
 
 def _absolute_url(base: str, href: str) -> str | None:
-    """Build a clean absolute URL without tracking query strings."""
     if not href:
         return None
     if href.startswith("/"):
         return f"{base}{href.split('?')[0]}"
-    return href
+    return href.split("?")[0]
 
 
 def _cache_get(key: str) -> SearchCompareResponse | None:
@@ -158,10 +187,12 @@ async def _new_stealth_context(browser) -> BrowserContext:
         locale="en-IN",
         timezone_id="Asia/Kolkata",
     )
-    # Block heavy assets so scrapes complete in 2-4 seconds.
-    # If a price selector suddenly returns nothing, try removing "css" here first.
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    # Keep CSS allowed so Flipkart/Amazon hydration & layouts work reliably
     await context.route(
-        "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,mp4,css}",
+        "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,mp4}",
         lambda route: route.abort(),
     )
     return context
@@ -173,7 +204,6 @@ async def _new_stealth_context(browser) -> BrowserContext:
 def _amazon_is_sponsored(card: Tag) -> bool:
     if card.select_one("span.puis-label-popover-default"):
         return True
-    # Fallback that doesn't depend on class names: a span whose text is exactly "Sponsored"
     return any(s.get_text(strip=True).lower() == "sponsored" for s in card.select("span"))
 
 
@@ -189,9 +219,8 @@ async def scrape_amazon_search(context: BrowserContext, query: str) -> PlatformR
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
         try:
-            await page.wait_for_selector(AMAZON_CARD, timeout=8000)
+            await page.wait_for_selector(AMAZON_CARD, timeout=10000)
         except PlaywrightTimeout:
-            # No cards: find out whether we were blocked or there were no results
             if _is_blocked(await page.content()):
                 logger.warning("amazon blocked the request (captcha) for query=%r", query)
             else:
@@ -218,10 +247,11 @@ async def scrape_amazon_search(context: BrowserContext, query: str) -> PlatformR
                 continue
 
             title = title_el.get_text(strip=True)
-            scored += 1
+            if _is_unwanted_accessory(query, title):
+                continue
 
+            scored += 1
             score = _match_score(query, title)
-            # Strictly greater, so on a tie the earlier (higher ranked) card wins
             if score <= best_score:
                 continue
 
@@ -258,6 +288,27 @@ async def scrape_amazon_search(context: BrowserContext, query: str) -> PlatformR
 # ---------------------------------------------------------------------------
 # Flipkart
 # ---------------------------------------------------------------------------
+def _extract_flipkart_title(card: Tag, link_el: Tag) -> str | None:
+    """Extract product title even when Flipkart rotates its CSS class names."""
+    title_el = _first(card, FLIPKART_TITLE)
+    if title_el and title_el.get_text(strip=True):
+        return title_el.get_text(strip=True)
+
+    if link_el.get("title"):
+        return link_el.get("title").strip()
+
+    img_el = card.select_one("img[alt]")
+    if img_el and img_el.get("alt") and len(img_el.get("alt").strip()) > 5:
+        return img_el.get("alt").strip()
+
+    # Fallback: longest anchor text inside the card
+    for a in card.select("a[href*='/p/']"):
+        txt = a.get_text(" ", strip=True)
+        if len(txt) > 8 and not txt.startswith("₹"):
+            return txt
+    return None
+
+
 async def scrape_flipkart_search(context: BrowserContext, query: str) -> PlatformResult | None:
     page = await context.new_page()
     try:
@@ -265,16 +316,20 @@ async def scrape_flipkart_search(context: BrowserContext, query: str) -> Platfor
         await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
         try:
-            await page.wait_for_selector(FLIPKART_CARD, timeout=8000)
+            await page.wait_for_selector("a[href*='/p/']", timeout=10000)
         except PlaywrightTimeout:
-            if _is_blocked(await page.content()):
+            html = await page.content()
+            if _is_blocked(html):
                 logger.warning("flipkart blocked the request for query=%r", query)
             else:
-                logger.info("flipkart returned no result cards for query=%r", query)
+                logger.info("flipkart returned no product links for query=%r (title=%r)", query, await page.title())
             return None
 
         soup = BeautifulSoup(await page.content(), "html.parser")
         cards = soup.select(FLIPKART_CARD)
+        # Fallback if Flipkart removed data-id wrappers: group by product anchor parents
+        if not cards:
+            cards = [a.parent.parent for a in soup.select("a[href*='/p/']") if a.parent and a.parent.parent]
 
         best_score = 0.0
         best_result: PlatformResult | None = None
@@ -288,18 +343,17 @@ async def scrape_flipkart_search(context: BrowserContext, query: str) -> Platfor
             if not link_el:
                 continue
 
-            # Flipkart uses several card layouts (list view vs grid view)
-            title_el = _first(card, FLIPKART_TITLE)
-            title = title_el.get_text(strip=True) if title_el else link_el.get("title")
+            title = _extract_flipkart_title(card, link_el)
+            if not title or _is_unwanted_accessory(query, title):
+                continue
 
             price_el = _first(card, FLIPKART_PRICE)
             price = _clean_price(price_el.get_text() if price_el else None)
             if price is None:
-                # Class-name-free fallback: first rupee amount in the card text
                 rupee = _RUPEE_PATTERN.search(card.get_text(" ", strip=True))
                 price = _clean_price(rupee.group(1)) if rupee else None
 
-            if not title or price is None:
+            if price is None:
                 continue
 
             scored += 1
@@ -380,7 +434,6 @@ async def compare_platforms(query: str) -> SearchCompareResponse:
         cheaper_platform=cheaper,
     )
 
-    # Cache only when something was found, so failures are retried next time
     if amazon_res or flipkart_res:
         _cache_set(cache_key, response)
 
@@ -388,10 +441,6 @@ async def compare_platforms(query: str) -> SearchCompareResponse:
 
 
 async def scrape_direct_product_price(url: str, platform: str) -> tuple[float | None, bool]:
-    """Re-scrapes a tracked product URL during background price checks.
-
-    Returns (price, in_stock). Failures are logged and return (None, False).
-    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=BROWSER_ARGS)
         try:
@@ -400,8 +449,6 @@ async def scrape_direct_product_price(url: str, platform: str) -> tuple[float | 
                 page = await context.new_page()
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-                # The price element is often visually hidden, so wait for it to be
-                # attached to the page, not visible. Ignore the timeout and parse anyway.
                 price_selector = (
                     "span.a-price span.a-offscreen" if platform == "amazon" else "div.Nx9bqj"
                 )
@@ -433,6 +480,9 @@ async def scrape_direct_product_price(url: str, platform: str) -> tuple[float | 
                         return None, False
                     price_el = soup.select_one("div.Nx9bqj.CxhGGd") or _first(soup, FLIPKART_PRICE)
                     price = _clean_price(price_el.get_text() if price_el else None)
+                    if price is None:
+                        rupee = _RUPEE_PATTERN.search(page_text)
+                        price = _clean_price(rupee.group(1)) if rupee else None
                     if price is None:
                         logger.info("flipkart: no price found for url=%s", url)
                     return price, price is not None
