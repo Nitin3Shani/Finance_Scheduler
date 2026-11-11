@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import time
@@ -194,6 +195,15 @@ def _cache_set(key: str, response: SearchCompareResponse) -> None:
     _cache[key] = (time.monotonic(), response)
 
 
+def _pick_best(query: str, candidates: list[PlatformResult]) -> PlatformResult | None:
+    best, best_score = None, 0.0
+    for r in candidates:
+        score = _match_score(query, r.title or "")
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score >= MIN_MATCH_SCORE else None
+
+
 async def _new_stealth_context(browser) -> BrowserContext:
     # Select a single string from the list
     ua = random.choice(USER_AGENTS) if isinstance(USER_AGENTS, (list, tuple)) else str(USER_AGENTS)
@@ -234,61 +244,62 @@ def _is_unavailable(card: Tag) -> bool:
     return "currently unavailable" in text or "out of stock" in text or "sold out" in text
 
 
-async def scrape_amazon_search(context: BrowserContext, url: str):
+async def scrape_amazon_search(context: BrowserContext, query: str) -> PlatformResult | None:
     page = await context.new_page()
     try:
-        # Apply stealth patches to mask Playwright environment
         await Stealth().apply_stealth_async(page)
-        
-        await page.set_extra_http_headers({
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://www.google.com/",
-            "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1"
-        })
-
-        # Navigate using domcontentloaded and wait for DOM stabilization
+        url = f"{AMAZON_BASE}/s?k={quote_plus(query)}"
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        
-        # Human-like delay and scrolling to trigger lazy-loaded DOM elements
-        await page.wait_for_timeout(random.randint(1000, 2000))
-        await page.evaluate("window.scrollBy(0, 400)")
-        await page.wait_for_timeout(500)
+        try:
+            await page.wait_for_selector(AMAZON_CARD, state="attached", timeout=8000)
+        except PlaywrightTimeout:
+            pass
+        await page.wait_for_timeout(random.randint(500, 1200))
 
-        content = await page.content()
-
-        # Check for CAPTCHA block
-        if "captcha" in content.lower() or "enter the characters you see below" in content.lower():
-            logger.warning("Amazon blocked direct price check for url=%s", url)
+        html = await page.content()
+        if _is_blocked(html):
+            logger.warning("Amazon blocked the search for query=%r", query)
             return None
 
-        soup = BeautifulSoup(content, "html.parser")
-        
-        # Select price from various potential DOM containers
-        price_el = (
-            soup.select_one(".apexPriceToPay span.a-offscreen") or
-            soup.select_one("#corePrice_feature_div span.a-offscreen") or
-            soup.select_one("#priceblock_ourprice") or
-            soup.select_one("#priceblock_dealprice") or
-            soup.select_one("span.a-price span.a-offscreen")
-        )
+        soup = BeautifulSoup(html, "html.parser")
+        candidates: list[PlatformResult] = []
+        for card in soup.select(AMAZON_CARD):
+            if len(candidates) >= MAX_CARDS_TO_SCORE:
+                break
+            if _amazon_is_sponsored(card) or _is_unavailable(card):
+                continue
 
-        if not price_el:
-            return None
+            title_el = _first(card, AMAZON_TITLE)
+            title = title_el.get_text(" ", strip=True) if title_el else None
+            if not title or _is_unwanted_accessory(query, title):
+                continue
 
-        return _clean_price(price_el.get_text())
+            # a-text-price is the struck-through MRP, so skip it
+            price_el = card.select_one("span.a-price:not(.a-text-price) span.a-offscreen") or _first(card, AMAZON_PRICE)
+            price = _clean_price(price_el.get_text() if price_el else None)
+            if price is None:
+                continue
 
+            asin = card.get("data-asin")
+            link_el = _first(card, AMAZON_LINK)
+            product_url = (
+                f"{AMAZON_BASE}/dp/{asin}" if asin
+                else _absolute_url(AMAZON_BASE, link_el.get("href", "")) if link_el else None
+            )
+            img_el = _first(card, AMAZON_IMAGE)
+            candidates.append(
+                PlatformResult(
+                    platform="amazon",
+                    title=title,
+                    price=price,
+                    image_url=img_el.get("src") if img_el else None,
+                    product_url=product_url,
+                    in_stock=True,
+                )
+            )
+        return _pick_best(query, candidates)
     except Exception:
-        logger.exception("Amazon scraping failed for url=%s", url)
+        logger.exception("Amazon search failed for query=%r", query)
         return None
     finally:
         await page.close()
@@ -317,54 +328,173 @@ def _extract_flipkart_title(card: Tag, link_el: Tag) -> str | None:
     return None
 
 
-async def scrape_flipkart_search(context: BrowserContext, url: str):
+_AD_LABELS = {"ad", "sponsored"}
+_PURE_PRICE = re.compile(r"₹\s*[\d,]+(?:\.\d+)?")
+
+
+def _flipkart_is_ad(card: Tag) -> bool:
+    """Sponsored results carry a small 'Ad' badge (a leaf element whose whole text is 'Ad')."""
+    for el in card.find_all(["div", "span"]):
+        if el.find(True) is None and el.get_text(strip=True).lower() in _AD_LABELS:
+            return True
+    return False
+
+
+def _flipkart_find_cards(soup: BeautifulSoup) -> list[Tag]:
+    """Outermost data-id cards; falls back to climbing from product links if classes/attrs change."""
+    cards = [c for c in soup.select(FLIPKART_CARD) if c.find_parent(attrs={"data-id": True}) is None]
+    if cards:
+        return cards
+
+    found: list[Tag] = []
+    seen: set[int] = set()
+    for link in soup.select(FLIPKART_LINK[0]):
+        node = link
+        for _ in range(6):
+            if node.parent is None:
+                break
+            node = node.parent
+            if "₹" in node.get_text(" ", strip=True):
+                break
+        if "₹" in node.get_text(" ", strip=True) and id(node) not in seen:
+            seen.add(id(node))
+            found.append(node)
+    return found
+
+
+def _flipkart_card_price(card: Tag) -> float | None:
+    """Selling price only: not the MRP, EMI ('₹x/month'), exchange or bank-offer amounts."""
+    for selector in FLIPKART_PRICE:
+        el = card.select_one(selector)
+        if el and _PURE_PRICE.fullmatch(el.get_text(strip=True)):
+            return _clean_price(el.get_text())
+
+    # Class-agnostic fallback: first text node that is *only* a price and isn't struck through.
+    # The selling price comes before the MRP in the DOM.
+    for node in card.find_all(string=_PURE_PRICE):
+        if not _PURE_PRICE.fullmatch(node.strip()):
+            continue
+        parent = node.parent
+        if parent.name in ("del", "s", "strike") or parent.find_parent(["del", "s", "strike"]):
+            continue
+        return _clean_price(node)
+    return None
+
+
+def _flipkart_card_image(card: Tag) -> str | None:
+    for img in card.select("img"):
+        src = img.get("src") or ""
+        if src.startswith("http"):
+            return src
+    return None
+
+
+_UNAVAILABLE_LABELS = {"sold out", "currently unavailable", "out of stock", "notify me"}
+
+
+def _flipkart_page_unavailable(soup: BeautifulSoup) -> bool:
+    """Only trust a stand-alone 'Sold Out' style label, not the words appearing in
+    recommended/similar products elsewhere on the page."""
+    for el in soup.find_all(["div", "span", "button"]):
+        if el.find(True) is None and el.get_text(strip=True).lower() in _UNAVAILABLE_LABELS:
+            return True
+    return False
+
+
+def _flipkart_detail_price(soup: BeautifulSoup) -> float | None:
+    """Selling price of the main product on a Flipkart product page."""
+    # 1. Structured data: stable even when CSS classes rotate.
+    for script in soup.select("script[type='application/ld+json']"):
+        try:
+            data = json.loads(script.string or "")
+        except (ValueError, TypeError):
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if not isinstance(item, dict) or item.get("@type") != "Product":
+                continue
+            offers = item.get("offers")
+            if isinstance(offers, list):
+                offers = offers[0] if offers else None
+            if isinstance(offers, dict):
+                price = _clean_price(str(offers.get("price", "")))
+                if price:
+                    return price
+
+    # 2. Known price classes (main product comes first in the DOM).
+    for selector in ("div.Nx9bqj.CxhGGd", *FLIPKART_PRICE):
+        el = soup.select_one(selector)
+        if el and _PURE_PRICE.fullmatch(el.get_text(strip=True)):
+            return _clean_price(el.get_text())
+
+    # 3. Class-agnostic: first stand-alone price that isn't struck through (the MRP).
+    #    No page-wide "first rupee sign" fallback: that picks up EMI/offer/ad amounts.
+    for node in soup.find_all(string=_PURE_PRICE):
+        if not _PURE_PRICE.fullmatch(node.strip()):
+            continue
+        parent = node.parent
+        if parent.name in ("del", "s", "strike", "script", "style") or parent.find_parent(["del", "s", "strike"]):
+            continue
+        return _clean_price(node)
+    return None
+
+
+async def scrape_flipkart_search(context: BrowserContext, query: str) -> PlatformResult | None:
     page = await context.new_page()
     try:
+        url = f"{FLIPKART_BASE}/search?q={quote_plus(query)}"
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1000)
+        try:
+            await page.wait_for_selector("a[href*='/p/']", state="attached", timeout=8000)
+        except PlaywrightTimeout:
+            pass
+        await page.evaluate("window.scrollBy(0, 600)")
+        await page.wait_for_timeout(800)
 
-        soup = BeautifulSoup(await page.content(), "html.parser")
-
-        # 1. Strip out sponsored ads, recommendation carousels, and footer sections
-        for tag in soup.select("div[class*='ad'], div[class*='sponsor'], div._3XINgP, div._2kHMtA, div._1eefn7"):
-            tag.decompose()
-
-        # 2. Scope extraction directly to the main buying container
-        buy_box = (
-            soup.select_one("div._25b18c") or          # Primary price container on detail pages
-            soup.select_one("div.hl25N") or           # Detail page header wrapper
-            soup.select_one("div.C2u-Bx") or           # Price box container
-            soup.select_one("div._1Yok0X._2Y-tyZ")     # Main product layout block
-        )
-
-        if buy_box:
-            # Target the current selling price element inside the buy box
-            price_el = (
-                buy_box.select_one("div.Nx9bqj") or
-                buy_box.select_one("div._30jeq3") or
-                buy_box.select_one("div._1vC4OE")
-            )
-        else:
-            price_el = (
-                soup.select_one("div._25b18c div.Nx9bqj") or
-                soup.select_one("div._25b18c div._30jeq3")
-            )
-
-        if not price_el:
-            logger.warning("Flipkart price node not found for url=%s", url)
+        html = await page.content()
+        if _is_blocked(html):
+            logger.warning("Flipkart blocked the search for query=%r", query)
             return None
 
-        cleaned_price = _clean_price(price_el.get_text())
+        soup = BeautifulSoup(html, "html.parser")
+        candidates: list[PlatformResult] = []
+        skipped_ads = 0
 
-        # Safety check: Ignore prices under ₹30,000 for high-end smartphones like iPhone 17
-        if "iphone" in url.lower() and cleaned_price and cleaned_price < 30000:
-            logger.warning("Scraped implausible low price (₹%s) for iPhone URL=%s", cleaned_price, url)
-            return None
+        for card in _flipkart_find_cards(soup):
+            if len(candidates) >= MAX_CARDS_TO_SCORE:
+                break
+            if _flipkart_is_ad(card):
+                skipped_ads += 1
+                continue
+            if _is_unavailable(card):
+                continue
 
-        return cleaned_price
+            link_el = card.select_one(FLIPKART_LINK[0])
+            if not link_el:
+                continue
+            title = _extract_flipkart_title(card, link_el)
+            if not title or _is_unwanted_accessory(query, title):
+                continue
 
+            price = _flipkart_card_price(card)
+            if price is None:
+                continue
+
+            candidates.append(
+                PlatformResult(
+                    platform="flipkart",
+                    title=title,
+                    price=price,
+                    image_url=_flipkart_card_image(card),
+                    product_url=_absolute_url(FLIPKART_BASE, link_el.get("href", "")),
+                    in_stock=True,
+                )
+            )
+
+        logger.info("flipkart: %d organic candidates, %d ads skipped for query=%r",
+                    len(candidates), skipped_ads, query)
+        return _pick_best(query, candidates)
     except Exception:
-        logger.exception("Flipkart direct scrape failed for url=%s", url)
+        logger.exception("Flipkart search failed for query=%r", query)
         return None
     finally:
         await page.close()
@@ -454,14 +584,9 @@ async def scrape_direct_product_price(url: str, platform: str) -> tuple[float | 
                     return price, price is not None
 
                 if platform == "flipkart":
-                    page_text = soup.get_text(" ", strip=True).lower()
-                    if "sold out" in page_text or "currently unavailable" in page_text:
+                    if _flipkart_page_unavailable(soup):
                         return None, False
-                    price_el = soup.select_one("div.Nx9bqj.CxhGGd") or _first(soup, FLIPKART_PRICE)
-                    price = _clean_price(price_el.get_text() if price_el else None)
-                    if price is None:
-                        rupee = _RUPEE_PATTERN.search(page_text)
-                        price = _clean_price(rupee.group(1)) if rupee else None
+                    price = _flipkart_detail_price(soup)
                     if price is None:
                         logger.info("flipkart: no price found for url=%s", url)
                     return price, price is not None
