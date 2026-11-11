@@ -12,7 +12,7 @@ from app.schemas import (
     PlatformStatsGroup,
     PricePoint,
     ProductHistoryResponse,
-    SearchCompareResponse,
+    SearchCompareResponse, 
     TrackProductRequest,
     TrackedProductResponse,
 )
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/products", tags=["Products & Price Tracking"])
 
 @router.get("/search", response_model=SearchCompareResponse)
 async def search_and_compare(
-    q: str = Query(..., min_length=2, max_length=100, description="Product search query"),
+    q: str = Query(..., alias="query",min_length=2, max_length=100, description="Product search query"),
     current_user: User = Depends(get_current_user),
 ):
     q = " ".join(q.split())   

@@ -24,7 +24,7 @@ class PlatformResult(BaseModel):
     price: float | None = Field(default=None, ge=0)
     image_url: str | None = None
     product_url: str | None = None
-    in_stock: bool
+    in_stock: bool 
 
 class SearchCompareResponse(BaseModel):
     query: str = Field(..., min_length=2)
@@ -38,8 +38,8 @@ class TrackProductRequest(BaseModel):
     image_url: str | None = Field(default=None, max_length=1000)
     amazon_url: str | None = Field(default=None, max_length=1000, pattern=r"^https?://.*")
     flipkart_url: str | None = Field(default=None, max_length=1000, pattern=r"^https?://.*")
-    initial_amazon_price: float  = Field(gt=0)
-    initial_flipkart_price: float  = Field( gt=0)
+    initial_amazon_price: float = Field(gt=0)
+    initial_flipkart_price: float = Field(gt=0)
 
 class TrackedProductResponse(BaseModel):
     id: int
@@ -56,12 +56,23 @@ class PricePoint(BaseModel):
     amazon_price: float | None = None
     flipkart_price: float | None = None
 
+# --- Platform Statistics Breakdown ---
+class PlatformStats(BaseModel):
+    lowest: float | None = None
+    highest: float | None = None
+    average: float | None = None
+
+class PlatformStatsGroup(BaseModel):
+    amazon: PlatformStats
+    flipkart: PlatformStats
+
 class ProductHistoryResponse(BaseModel):
     product_id: int
     title: str
     lowest_price: float | None = None
     highest_price: float | None = None
     average_price: float | None = None
+    stats_by_platform: PlatformStatsGroup
     chart_data: list[PricePoint]
 
 # --- Price Alerts ---

@@ -21,21 +21,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PricePulse — E-Commerce Price Tracker API",
     description="Async Amazon & Flipkart price comparison, historical analytics, and automated email alerts.",
-    version="1.0.0",
+    version="v1",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:3000",],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(auth.router, prefix=f"/{app.version}")
-app.include_router(product_router.router, prefix=f"/{app.version}")
-app.include_router(alert_router.router, prefix=f"/{app.version}")
+app.include_router(auth.router)
+app.include_router(product_router.router)
+app.include_router(alert_router.router)
 
 @app.get("/health", tags=["System"])
 async def health_check():
