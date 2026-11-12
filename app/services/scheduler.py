@@ -114,7 +114,7 @@ def start_scheduler() -> None:
         scheduler.add_job(
             check_all_tracked_products,
             trigger="interval",
-            minutes=5,  
+            minutes=10,  
             id=JOB_ID
     )
 
